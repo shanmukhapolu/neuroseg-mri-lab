@@ -105,7 +105,7 @@ else:
 
 img_height, img_width = img.shape
 
-# Keep track of file changes to reset clicks
+# Keep track of file changes to reset clicks safely
 current_file_id = uploaded_file.name if uploaded_file else "synthetic"
 if "prev_file" not in st.session_state or st.session_state.prev_file != current_file_id:
     st.session_state.coord_x = int(img_width * 0.64)  # Default on tumor center
@@ -120,9 +120,9 @@ with col_sidebar:
     st.subheader("Fine-Tuning Parameters")
     
     if algo == "Active Contour Model (Snakes)":
-        st.info("💡 **Click on the scan image** to reposition the circle center, or use the sliders below.")
+        st.info("💡 **Click directly on the MRI scan** to position the circle. Adjust properties below.")
         
-        # Pull coordinates directly from coordinate state, pushing changes back to session_state
+        # Sliders read from and write directly to coord_x / coord_y session state
         init_x = st.slider("Circle Center X", 0, img_width, int(st.session_state.coord_x), key="slider_x")
         init_y = st.slider("Circle Center Y", 0, img_height, int(st.session_state.coord_y), key="slider_y")
         st.session_state.coord_x = init_x
@@ -134,7 +134,7 @@ with col_sidebar:
         beta = st.slider("Stiffness (Beta)", 0.1, 5.0, 1.0, help="Controls how smooth/rigid the snake stays.")
         
     elif algo == "Region Growing":
-        st.info("💡 **Click on the scan image** to place your seed point inside the tumor structure.")
+        st.info("💡 **Click directly on the MRI scan** to place your seed point inside the tumor structure.")
         
         seed_x = st.slider("Seed Coordinate X", 0, img_width, int(st.session_state.coord_x), key="slider_x")
         seed_y = st.slider("Seed Coordinate Y", 0, img_height, int(st.session_state.coord_y), key="slider_y")
@@ -146,72 +146,61 @@ with col_sidebar:
 # Main Screen layout
 with col_main:
     st.subheader("Interactive Workspace")
-    st.write("Click anywhere on the left scan below to dynamically shift target coordinates in real time.")
+    st.write("Click anywhere on the clean scan below. The coordinates and calculations will update instantly.")
     
     # -------------------------------------------------------------------------
-    # CANVAS GENERATION FOR INTERACTIVE CLICKS
+    # 1. CLEAN INTERACTIVE CLICK CANVAS (NO OVERLAYS, NO MATPLOTLIB MARGINS)
     # -------------------------------------------------------------------------
-    fig_click, ax_click = plt.subplots(figsize=(5, 5))
-    ax_click.imshow(img, cmap='gray')
-    ax_click.axis('off')
+    # Convert raw image directly to uint8 PIL Image so coordinate ratios are perfectly linear
+    pil_img = Image.fromarray((img * 255).astype(np.uint8))
     
-    if algo == "Active Contour Model (Snakes)":
-        s_test = np.linspace(0, 2 * np.pi, 200)
-        r_test = st.session_state.coord_y + radius * np.sin(s_test)
-        c_test = st.session_state.coord_x + radius * np.cos(s_test)
-        ax_click.plot(c_test, r_test, '--r', lw=2, label="Placement Ring")
-    else:
-        ax_click.plot(st.session_state.coord_x, st.session_state.coord_y, 'ro', markersize=8, label="Seed Point")
+    # STATIC KEY: Keeps the component loaded in the DOM without destructive reload flashing
+    clicked_coords = streamlit_image_coordinates(pil_img, width=400, key="mri_interactive_canvas")
     
-    buf = io.BytesIO()
-    fig_click.savefig(buf, format="png", bbox_inches='tight', pad_inches=0)
-    buf.seek(0)
-    plt.close(fig_click)
-    
-    # We use a unique key combined with the coordinates so that canvas state registers clicks cleanly
-    canvas_key = f"canvas_click_{st.session_state.coord_x}_{st.session_state.coord_y}_{algo}"
-    clicked_coords = streamlit_image_coordinates(Image.open(buf), width=450, key=canvas_key)
-    
-    # Capture click feedback and convert back to native matrix resolution space
+    # Process click coordinates if user clicks on the raw scan
     if clicked_coords is not None:
         canvas_w = clicked_coords["width"]
         canvas_h = clicked_coords["height"]
         
-        # Precise coordinate interpolation mapping
+        # Perfect, margin-free linear mapping
         raw_x = int((clicked_coords["x"] / canvas_w) * img_width)
         raw_y = int((clicked_coords["y"] / canvas_h) * img_height)
         
         clamped_x = max(0, min(raw_x, img_width - 1))
         clamped_y = max(0, min(raw_y, img_height - 1))
         
+        # Only rerun if the coordinates actually shifted to avoid rendering loops
         if clamped_x != st.session_state.coord_x or clamped_y != st.session_state.coord_y:
             st.session_state.coord_x = clamped_x
             st.session_state.coord_y = clamped_y
             st.rerun()
 
     # -------------------------------------------------------------------------
-    # SEGMENTATION PROCESSING PIPELINE
+    # 2. SEGMENTATION PIPELINE AND RESULTS OUTPUT
     # -------------------------------------------------------------------------
     st.markdown("### Processed Results")
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     
     axes[0].imshow(img, cmap='gray')
-    axes[0].set_title("Input MRI Scan")
+    axes[0].set_title("Input MRI Scan (With Target Marker)")
     axes[0].axis('off')
     
     if algo == "Active Contour Model (Snakes)":
+        # Calculate initial circular boundary
         s = np.linspace(0, 2*np.pi, 400)
         r = st.session_state.coord_y + radius * np.sin(s)
         c = st.session_state.coord_x + radius * np.cos(s)
         init_boundary = np.array([r, c]).T
         
+        # Draw red target placement circle on Input
         axes[0].plot(init_boundary[:, 1], init_boundary[:, 0], '--r', lw=2, label="Initial Boundary")
         axes[0].legend(loc="upper left")
         
-        # Smooth and calculate Active Contour (Snakes)
+        # Smooth image and compute active contour
         smoothed = gaussian(img, 2)
         snake = active_contour(smoothed, init_boundary, alpha=alpha, beta=beta, gamma=0.001)
         
+        # Plot final contour on output
         axes[1].imshow(img, cmap='gray')
         axes[1].plot(snake[:, 1], snake[:, 0], '-b', lw=3, label="Segmented Outline")
         axes[1].set_title("Segmented Output (Active Contour)")
@@ -221,15 +210,19 @@ with col_main:
         st.success(f"📈 **Biomedical Metric:** Segmented tumor boundary length is approximately **{len(snake):.1f} pixels**.")
 
     elif algo == "Region Growing":
-        axes[0].plot(st.session_state.coord_x, st.session_state.coord_y, 'ro', markersize=6, label="User Seed Point")
+        # Draw red target seed point on Input
+        axes[0].plot(st.session_state.coord_x, st.session_state.coord_y, 'ro', markersize=8, label="Seed Point")
         axes[0].legend(loc="upper left")
         
+        # Run region growing
         with st.spinner("Processing pixel matrices..."):
             mask = region_growing(img, (st.session_state.coord_y, st.session_state.coord_x), tolerance)
         
+        # Create RGB overlay with segmented area highlighed in red
         overlay = np.stack([img, img, img], axis=-1)
-        overlay[mask == 255] = [0.8, 0.1, 0.1]  # Highlight mask overlay in light red
+        overlay[mask == 255] = [0.8, 0.1, 0.1]
         
+        # Plot final mask overlay on output
         axes[1].imshow(overlay)
         axes[1].set_title("Segmented Output (Region Growing)")
         axes[1].axis('off')
@@ -239,7 +232,7 @@ with col_main:
 
     st.pyplot(fig)
 
-    # Architectural Overview
+    # Educational Math Breakdowns
     st.markdown("---")
     st.markdown("### Under the Hood: The Mathematical Algorithms")
     
