@@ -15,6 +15,10 @@ st.set_page_config(
 
 load_css()
 
+overlay = None
+gradient = None
+heatmap = None
+
 st.markdown(
     """
     <div class="main-title">
