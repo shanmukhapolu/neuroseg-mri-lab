@@ -4,7 +4,6 @@ import cv2
 import matplotlib.pyplot as plt
 from skimage.segmentation import active_contour
 from skimage.filters import gaussian
-from skimage.draw import disk
 from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image
 import io
@@ -17,7 +16,6 @@ st.set_page_config(page_title="NeuroSeg - MRI Segmentation Lab", layout="wide")
 @st.cache_data
 def generate_synthetic_mri():
     """Generates a realistic synthetic 2D brain MRI slice with a tumor."""
-    # Create dark background
     img = np.zeros((256, 256), dtype=np.float32)
     
     # 1. Draw skull boundary
@@ -60,7 +58,6 @@ def region_growing(img, seed, tolerance):
     h, w = img.shape
     segmented = np.zeros_like(img, dtype=np.uint8)
     
-    # Check boundaries for seed coordinates
     seed_y, seed_x = int(seed[0]), int(seed[1])
     if not (0 <= seed_y < h and 0 <= seed_x < w):
         return segmented
@@ -81,7 +78,6 @@ def region_growing(img, seed, tolerance):
             if 0 <= ny < h and 0 <= nx < w:
                 if segmented[ny, nx] == 0:
                     intensity = img[ny, nx]
-                    # Check if neighbor intensity is close enough to seed intensity
                     if abs(intensity - seed_intensity) <= tolerance:
                         segmented[ny, nx] = 255
                         queue.append((ny, nx))
@@ -96,27 +92,25 @@ st.write("An advanced playground showcasing **classic medical computer vision** 
 
 col_sidebar, col_main = st.columns([1, 3])
 
-# Load or generate image FIRST to know dimensions for the sidebar limits
+# Load or generate image FIRST to know dimensions for coordinate initialization
 uploaded_file = st.file_uploader("Upload an MRI Slice (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
-    # Convert uploaded file to grayscale
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     color_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
-    # Normalize to [0, 1] range
     img = gray_img.astype(np.float32) / 255.0
 else:
     img = generate_synthetic_mri()
 
-# Get dynamic height and width of the image
 img_height, img_width = img.shape
 
-# Initialize session states for mouse clicks dynamically based on the active image
-if "coord_x" not in st.session_state or st.session_state.get("prev_file") != (uploaded_file.name if uploaded_file else "synthetic"):
-    st.session_state.coord_x = int(img_width * 0.64)  # Default coordinates near the synthetic tumor
+# Keep track of file changes to reset clicks
+current_file_id = uploaded_file.name if uploaded_file else "synthetic"
+if "prev_file" not in st.session_state or st.session_state.prev_file != current_file_id:
+    st.session_state.coord_x = int(img_width * 0.64)  # Default on tumor center
     st.session_state.coord_y = int(img_height * 0.37)
-    st.session_state.prev_file = uploaded_file.name if uploaded_file else "synthetic"
+    st.session_state.prev_file = current_file_id
 
 with col_sidebar:
     st.header("1. Controls")
@@ -126,30 +120,24 @@ with col_sidebar:
     st.subheader("Fine-Tuning Parameters")
     
     if algo == "Active Contour Model (Snakes)":
-        st.info("💡 **Click on the scan** to position the circle. Adjust the radius and physics properties below.")
+        st.info("💡 **Click on the scan image** to reposition the circle center, or use the sliders below.")
         
-        # Dynamic coordinate sliders updated by state
-        init_x = st.slider("Circle Center X", 0, img_width, int(st.session_state.coord_x), key="slide_x")
-        init_y = st.slider("Circle Center Y", 0, img_height, int(st.session_state.coord_y), key="slide_y")
-        
-        # Keep track of slider edits changing coordinates
+        # Pull coordinates directly from coordinate state, pushing changes back to session_state
+        init_x = st.slider("Circle Center X", 0, img_width, int(st.session_state.coord_x), key="slider_x")
+        init_y = st.slider("Circle Center Y", 0, img_height, int(st.session_state.coord_y), key="slider_y")
         st.session_state.coord_x = init_x
         st.session_state.coord_y = init_y
         
-        # Contour parameters
         max_radius = int(min(img_width, img_height) / 2)
         radius = st.slider("Initial Circle Radius", 5, max_radius, int(min(img_width, img_height) * 0.1))
         alpha = st.slider("Elasticity (Alpha)", 0.01, 0.50, 0.05, help="Controls how easily the snake stretches.")
         beta = st.slider("Stiffness (Beta)", 0.1, 5.0, 1.0, help="Controls how smooth/rigid the snake stays.")
         
     elif algo == "Region Growing":
-        st.info("💡 **Click on the scan** to place your seed point inside the tumor boundary.")
+        st.info("💡 **Click on the scan image** to place your seed point inside the tumor structure.")
         
-        # Dynamic coordinate sliders updated by state
-        seed_x = st.slider("Seed Coordinate X", 0, img_width, int(st.session_state.coord_x), key="slide_x")
-        seed_y = st.slider("Seed Coordinate Y", 0, img_height, int(st.session_state.coord_y), key="slide_y")
-        
-        # Keep track of slider edits changing coordinates
+        seed_x = st.slider("Seed Coordinate X", 0, img_width, int(st.session_state.coord_x), key="slider_x")
+        seed_y = st.slider("Seed Coordinate Y", 0, img_height, int(st.session_state.coord_y), key="slider_y")
         st.session_state.coord_x = seed_x
         st.session_state.coord_y = seed_y
         
@@ -158,62 +146,60 @@ with col_sidebar:
 # Main Screen layout
 with col_main:
     st.subheader("Interactive Workspace")
-    st.write("Click directly inside the left image below to instantly relocate your circle center or seed point.")
+    st.write("Click anywhere on the left scan below to dynamically shift target coordinates in real time.")
     
-    # --- INTERACTIVE CLICK COMPONENT ---
-    # Create a clean visual overlay with the seed marker/circle for the interactive canvas
-    # We build a high-resolution display figure to pass to streamlit_image_coordinates
+    # -------------------------------------------------------------------------
+    # CANVAS GENERATION FOR INTERACTIVE CLICKS
+    # -------------------------------------------------------------------------
     fig_click, ax_click = plt.subplots(figsize=(5, 5))
     ax_click.imshow(img, cmap='gray')
     ax_click.axis('off')
     
     if algo == "Active Contour Model (Snakes)":
-        s_test = np.linspace(0, 2*np.pi, 200)
+        s_test = np.linspace(0, 2 * np.pi, 200)
         r_test = st.session_state.coord_y + radius * np.sin(s_test)
         c_test = st.session_state.coord_x + radius * np.cos(s_test)
         ax_click.plot(c_test, r_test, '--r', lw=2, label="Placement Ring")
     else:
         ax_click.plot(st.session_state.coord_x, st.session_state.coord_y, 'ro', markersize=8, label="Seed Point")
     
-    # Save figure to a temporary buffer so streamlit-image-coordinates can render it
     buf = io.BytesIO()
     fig_click.savefig(buf, format="png", bbox_inches='tight', pad_inches=0)
     buf.seek(0)
     plt.close(fig_click)
     
-    # Render the canvas. It will auto-scale any large resolution image beautifully
-    clicked_coords = streamlit_image_coordinates(Image.open(buf), width=450)
+    # We use a unique key combined with the coordinates so that canvas state registers clicks cleanly
+    canvas_key = f"canvas_click_{st.session_state.coord_x}_{st.session_state.coord_y}_{algo}"
+    clicked_coords = streamlit_image_coordinates(Image.open(buf), width=450, key=canvas_key)
     
-    # If the user clicks on the image, map screen-space pixels back to true image-space coordinates
+    # Capture click feedback and convert back to native matrix resolution space
     if clicked_coords is not None:
-        # Calculate scaling ratios between canvas resolution (450w) and true image resolution
         canvas_w = clicked_coords["width"]
         canvas_h = clicked_coords["height"]
         
+        # Precise coordinate interpolation mapping
         raw_x = int((clicked_coords["x"] / canvas_w) * img_width)
         raw_y = int((clicked_coords["y"] / canvas_h) * img_height)
         
-        # Bound limits to protect matrix errors
         clamped_x = max(0, min(raw_x, img_width - 1))
         clamped_y = max(0, min(raw_y, img_height - 1))
         
-        # If coordinates changed, update state and redraw
         if clamped_x != st.session_state.coord_x or clamped_y != st.session_state.coord_y:
             st.session_state.coord_x = clamped_x
             st.session_state.coord_y = clamped_y
             st.rerun()
 
-    # --- PROCESSING PIPELINE AND METRICS OUTPUT ---
+    # -------------------------------------------------------------------------
+    # SEGMENTATION PROCESSING PIPELINE
+    # -------------------------------------------------------------------------
     st.markdown("### Processed Results")
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     
-    # Plot 1: Input scan
     axes[0].imshow(img, cmap='gray')
     axes[0].set_title("Input MRI Scan")
     axes[0].axis('off')
     
     if algo == "Active Contour Model (Snakes)":
-        # Render initial circle
         s = np.linspace(0, 2*np.pi, 400)
         r = st.session_state.coord_y + radius * np.sin(s)
         c = st.session_state.coord_x + radius * np.cos(s)
@@ -222,12 +208,10 @@ with col_main:
         axes[0].plot(init_boundary[:, 1], init_boundary[:, 0], '--r', lw=2, label="Initial Boundary")
         axes[0].legend(loc="upper left")
         
-        # Run Active Contour algorithm
+        # Smooth and calculate Active Contour (Snakes)
         smoothed = gaussian(img, 2)
-        # Handle edge scaling boundary issues
         snake = active_contour(smoothed, init_boundary, alpha=alpha, beta=beta, gamma=0.001)
         
-        # Plot 2: Segmented Active Contour output
         axes[1].imshow(img, cmap='gray')
         axes[1].plot(snake[:, 1], snake[:, 0], '-b', lw=3, label="Segmented Outline")
         axes[1].set_title("Segmented Output (Active Contour)")
@@ -237,19 +221,15 @@ with col_main:
         st.success(f"📈 **Biomedical Metric:** Segmented tumor boundary length is approximately **{len(snake):.1f} pixels**.")
 
     elif algo == "Region Growing":
-        # Draw target seed marker on original input axis
         axes[0].plot(st.session_state.coord_x, st.session_state.coord_y, 'ro', markersize=6, label="User Seed Point")
         axes[0].legend(loc="upper left")
         
-        # Run custom region growing algorithm
         with st.spinner("Processing pixel matrices..."):
             mask = region_growing(img, (st.session_state.coord_y, st.session_state.coord_x), tolerance)
         
-        # Create visual RGB overlay mask
         overlay = np.stack([img, img, img], axis=-1)
-        overlay[mask == 255] = [0.8, 0.1, 0.1]  # Draw tumor mask in red
+        overlay[mask == 255] = [0.8, 0.1, 0.1]  # Highlight mask overlay in light red
         
-        # Plot 2: Segmented Region Growing output
         axes[1].imshow(overlay)
         axes[1].set_title("Segmented Output (Region Growing)")
         axes[1].axis('off')
@@ -259,7 +239,7 @@ with col_main:
 
     st.pyplot(fig)
 
-    # Explanation section to show deep architectural understanding
+    # Architectural Overview
     st.markdown("---")
     st.markdown("### Under the Hood: The Mathematical Algorithms")
     
